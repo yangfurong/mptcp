@@ -6,10 +6,12 @@
 obj-$(CONFIG_MPTCP) += mptcp.o
 
 mptcp-y := mptcp_ctrl.o mptcp_ipv4.o mptcp_pm.o \
-	   mptcp_output.o mptcp_input.o mptcp_sched.o
+	   mptcp_output.o mptcp_input.o mptcp_sched.o \
+	   mptcp_sbd.o
 
 obj-$(CONFIG_TCP_CONG_LIA) += mptcp_coupled.o
 obj-$(CONFIG_TCP_CONG_OLIA) += mptcp_olia.o
+obj-$(CONFIG_TCP_CONG_OLIASBDX) += mptcp_oliasbdx.o
 obj-$(CONFIG_TCP_CONG_WVEGAS) += mptcp_wvegas.o
 obj-$(CONFIG_TCP_CONG_BALIA) += mptcp_balia.o
 obj-$(CONFIG_TCP_CONG_MCTCPDESYNC) += mctcp_desync.o

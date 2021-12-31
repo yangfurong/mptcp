@@ -110,7 +110,7 @@ struct mptcp_request_sock {
 };
 
 struct mptcp_options_received {
-	u16	saw_mpc:1,
+	u32	saw_mpc:1,
 		dss_csum:1,
 		drop_me:1,
 
@@ -131,7 +131,9 @@ struct mptcp_options_received {
 		more_rem_addr:1, /* Saw one more rem-addr. */
 
 		mp_fail:1,
-		mp_fclose:1;
+		mp_fclose:1,
+		mp_group:1,
+		mp_timestamp:1;
 	u8	rem_id;		/* Address-id in the MP_JOIN */
 	u8	prio_addr_id;	/* Address-id in the MP_PRIO */
 
@@ -153,6 +155,47 @@ struct mptcp_options_received {
 	u32	mptcp_recv_nonce;
 	u64	mptcp_recv_tmac;
 	u8	mptcp_recv_mac[20];
+
+	u8 	mptcp_group_epoch;
+	u8  	mptcp_group;
+	u16  	mptcp_group_flow_id;
+
+	s64	mptcp_rcv_ns;  // when received locally, nsecs
+ 	s64	mptcp_rcvd_us; // what we received from remote end, usecs
+	int	mptcp_loss; // true if server experiences 1 loss
+};
+
+struct mptcp_owd_snapshot {
+  s64 cache_local_mean;
+  u64 next_sample_allowed;
+
+  s64 sum_usecs;  // sum of all received owd samples
+  s64 max_usecs;  // maximum of all received owd samples
+  s64 mad_var_sum; // sum for MAD owd variance
+  int count;      // number of received owd samples
+  int skew_lcount, skew_rcount; // number of owd samples < and > long term mean
+  int index;      // snapshot index, starts at 0, increments every SBD_T msecs
+  int loss_count; // number of experienced loss events
+};
+
+#define SBD_T 350 // in msecs
+#define SBD_N 50
+#define SBD_N_1 (SBD_N+1) // one snapshot is always under construction
+
+#define MPTCP_GROUP_HISTORY_SIZE 8
+
+struct mptcp_group_item {
+	u8 epoch; // value 0 marks item as invalid (there's no epoch 0)
+	u8 group;
+};
+
+#define SBD_MAX_OBSERVATIONS 10
+// max 32 subflows path indices [1;32], after each one at most a separator of its own group = 32+32 = 65
+#define SBD_OBSERVATION_MAX_TEXT_LEN 64
+
+struct mptcp_sbd_observation {
+  int  len;
+  char text[SBD_OBSERVATION_MAX_TEXT_LEN+1]; // +1 for string terminator
 };
 
 struct mptcp_tcp_sock {
@@ -202,6 +245,14 @@ struct mptcp_tcp_sock {
 
 	/* HMAC of the third ack */
 	char sender_mac[20];
+
+	struct mptcp_group_item group_history[MPTCP_GROUP_HISTORY_SIZE]; // ringbuffer
+	int                     group_history_next;
+	// mpcb has a lock which must be held during updates
+
+	struct mptcp_owd_snapshot owd_snapshots[SBD_N_1];
+	int                       owd_snapshot_next;
+	int                       previously_congested;
 };
 
 struct mptcp_tw {
@@ -342,6 +393,19 @@ struct mptcp_cb {
 	int orig_sk_sndbuf;
 	u32 orig_window_clamp;
 
+	/* MPTCP-SBD: code from the sbd patch*/
+	s64 start_ns; // creation time of the socket in system time, unit: nanoseconds
+
+	spinlock_t snapshots_lock;     // must be held whenever owd_snapshot_next, or owd_snapshots, or sbd_observations are modified
+	spinlock_t group_history_lock; // must be held when updating any subflow's received group info
+
+	char groups[32]; // one group value per subflow
+	u8   groups_epoch;
+	int  next_groups_idx; // for which subflow to transmit info next
+
+	struct mptcp_sbd_observation sbd_observations[SBD_MAX_OBSERVATIONS];
+	int                          sbd_observations_count;
+
 	struct tcp_info	*master_info;
 };
 
@@ -422,6 +486,14 @@ struct mptcp_cb {
 #define MPTCP_SUB_LEN_FCLOSE	12
 #define MPTCP_SUB_LEN_FCLOSE_ALIGN	12
 
+#define MPTCP_SUB_TIMESTAMP	8
+#define MPTCP_SUB_LEN_TIMESTAMP	8
+#define MPTCP_SUB_LEN_TIMESTAMP_ALIGN	8
+
+#define MPTCP_SUB_GROUP	9
+#define MPTCP_SUB_LEN_GROUP	8
+#define MPTCP_SUB_LEN_GROUP_ALIGN	8
+
 
 #define OPTION_MPTCP		(1 << 5)
 
@@ -445,6 +517,8 @@ extern bool mptcp_init_failed;
 #define OPTION_MP_FCLOSE	(1 << 8)
 #define OPTION_REMOVE_ADDR	(1 << 9)
 #define OPTION_MP_PRIO		(1 << 10)
+#define OPTION_MP_TIMESTAMP	(1 << 11)
+#define OPTION_MP_GROUP	    (1 << 12)
 
 /* MPTCP flags: both TX and RX */
 #define MPTCPHDR_SEQ		0x01 /* DSS.M option is present */
@@ -645,6 +719,43 @@ struct mp_prio {
 #error	"Adjust your <asm/byteorder.h> defines"
 #endif
 	__u8	addr_id;
+} __attribute__((__packed__));
+
+/*MPTCP-SBD: code from the sbd patch*/
+struct mp_timestamp {
+	__u8	kind;
+	__u8	len;
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u16	rsv1:4,
+		sub:4,
+		rsv2:8;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u16	sub:4,
+		rsv1:4,
+		rsv2:8;
+#else
+#error  "Adjust your <asm/byteorder.h> defines"
+#endif
+	__u32	time_usecs;
+} __attribute__((__packed__));
+
+struct mp_group {
+	__u8	kind;
+	__u8	len;
+#if defined(__LITTLE_ENDIAN_BITFIELD)
+	__u16	rsv1:4,
+		sub:4,
+		rsv2:8;
+#elif defined(__BIG_ENDIAN_BITFIELD)
+	__u16	sub:4,
+		rsv1:4,
+		rsv2:8;
+#else
+#error  "Adjust your <asm/byteorder.h> defines"
+#endif
+	__u8   epoch;
+	__u8   group;
+	__u16  flow_id;
 } __attribute__((__packed__));
 
 static inline int mptcp_sub_len_dss(const struct mp_dss *m, const int csum)
@@ -1086,6 +1197,8 @@ static inline void mptcp_init_mp_opt(struct mptcp_options_received *mopt)
 
 	mopt->mp_fail = 0;
 	mopt->mp_fclose = 0;
+	mopt->mp_group = 0;
+	mopt->mp_timestamp = 0;
 }
 
 static inline void mptcp_reset_mopt(struct tcp_sock *tp)
@@ -1100,6 +1213,8 @@ static inline void mptcp_reset_mopt(struct tcp_sock *tp)
 	mopt->join_ack = 0;
 	mopt->mp_fail = 0;
 	mopt->mp_fclose = 0;
+	mopt->mp_group = 0;
+	mopt->mp_timestamp = 0;
 }
 
 static inline __be32 mptcp_get_highorder_sndbits(const struct sk_buff *skb,

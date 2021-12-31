@@ -288,9 +288,30 @@ static void mptcp_olia_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	}
 }
 
+ 
+static u32 mptcp_olia_ssthresh(struct sock *sk)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+	const struct mptcp_cb *mpcb = tp->mpcb;
+
+	if (unlikely(!mptcp(tp)))
+		return tcp_reno_ssthresh(sk);
+    else
+		return max(tp->snd_cwnd >> 1U, 1U); // let it go down to 1
+}
+
+// identical to tcp_reno_min_cwnd but can deal with ssthresh=1
+// (and then doesn't let CWND go below 1)
+/* static u32 mptcp_olia_min_cwnd(const struct sock *sk)
+{
+    const struct tcp_sock *tp = tcp_sk(sk);
+    return max(tp->snd_ssthresh/2, 1U);
+}*/
+
+
 static struct tcp_congestion_ops mptcp_olia = {
 	.init		= mptcp_olia_init,
-	.ssthresh	= tcp_reno_ssthresh,
+	.ssthresh	= mptcp_olia_ssthresh,
 	.cong_avoid	= mptcp_olia_cong_avoid,
 	.undo_cwnd	= tcp_reno_undo_cwnd,
 	.set_state	= mptcp_olia_set_state,

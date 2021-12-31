@@ -30,6 +30,7 @@
 #include <linux/kconfig.h>
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
+#include <linux/time.h>
 
 #include <net/mptcp.h>
 #include <net/mptcp_v4.h>
@@ -1038,6 +1039,7 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct mptcp_cb *mpcb = tp->mpcb;
 	const struct tcp_skb_cb *tcb = skb ? TCP_SKB_CB(skb) : NULL;
+	int has_groups = 0;
 
 	/* We are coming from tcp_current_mss with the meta_sk as an argument.
 	 * It does not make sense to check for the options, because when the
@@ -1150,6 +1152,24 @@ void mptcp_established_options(struct sock *sk, struct sk_buff *skb,
 		*size += MPTCP_SUB_LEN_PRIO_ALIGN;
 	}
 
+	if (MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_GROUP_ALIGN) {
+		if (tp->mpcb->groups_epoch != 0) { // groups have been set
+			opts->options |= OPTION_MPTCP;
+			opts->mptcp_options |= OPTION_MP_GROUP;
+			*size += MPTCP_SUB_LEN_GROUP_ALIGN;
+			has_groups = 1;
+		}
+	}
+
+	// NOTE: either GROUP or TIMESTAMP!
+	if (!has_groups) {
+	  if (MAX_TCP_OPTION_SPACE - *size >= MPTCP_SUB_LEN_TIMESTAMP_ALIGN) {
+		  opts->options |= OPTION_MPTCP;
+		  opts->mptcp_options |= OPTION_MP_TIMESTAMP;
+		  *size += MPTCP_SUB_LEN_TIMESTAMP_ALIGN;
+	  }
+	}
+
 	return;
 }
 
@@ -1168,6 +1188,29 @@ u16 mptcp_select_window(struct sock *sk)
 
 	return new_win;
 }
+
+u16 mptcp_get_subflow_flow_id(struct tcp_sock *meta_tp, int pi)
+{
+       struct sock *sk_it;
+	   struct mptcp_tcp_sock *mptcp;
+	   struct mptcp_cb *mpcb = meta_tp->mpcb;
+	   struct tcp_sock *tp;
+	   struct inet_sock *inet; 
+
+       if (!meta_tp)
+               return 0;
+
+       mptcp_for_each_sub(mpcb, mptcp) {
+		   	sk_it = mptcp_to_sock(mptcp);
+            tp = tcp_sk(sk_it);
+            if (tp->mptcp && tp->mptcp->path_index == pi) {
+                inet = inet_sk(sk_it);
+                return inet->inet_sport;
+            }
+       }
+       return 0;
+}
+
 
 void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 			 const struct tcp_out_options *opts,
@@ -1335,6 +1378,59 @@ void mptcp_options_write(__be32 *ptr, struct tcp_sock *tp,
 		mpprio->addr_id = TCPOPT_NOP;
 
 		ptr += MPTCP_SUB_LEN_PRIO_ALIGN >> 2;
+	}
+
+	if (unlikely(OPTION_MP_GROUP & opts->mptcp_options)) {
+		struct mp_group *mpgrp = (struct mp_group *)ptr;
+
+		// determine for which subflow group info should be sent
+		int i, idx = tp->mpcb->next_groups_idx % 32;
+		int found = 0;
+		for (i = 0; i < 32; ++i) {
+			if (tp->mpcb->groups[idx] > 0) {
+				found = 1;
+				break; // if this one has a group, we'll send info about it
+			}
+			idx = (idx + 1) % 32;
+		}
+		tp->mpcb->next_groups_idx = idx + 1;
+
+		mpgrp->kind = TCPOPT_MPTCP;
+		mpgrp->len = MPTCP_SUB_LEN_GROUP;
+		mpgrp->sub = MPTCP_SUB_GROUP;
+		mpgrp->rsv1 = 0;
+		mpgrp->rsv2 = 0;
+
+		mpgrp->epoch = tp->mpcb->groups_epoch;
+		mpgrp->group = tp->mpcb->groups[idx];
+		mpgrp->flow_id = found ? mptcp_get_subflow_flow_id(mptcp_meta_tp(tp), idx+1 /*pi*/) : 0;
+
+		ptr += MPTCP_SUB_LEN_GROUP_ALIGN >> 2;
+	}
+
+	if (unlikely(OPTION_MP_TIMESTAMP & opts->mptcp_options)) {
+		struct timespec now;
+		struct mp_timestamp *mpts = (struct mp_timestamp *)ptr;
+		s64 now_us;
+
+		getnstimeofday(&now);
+		now_us = timespec_to_ns(&now) - tp->mpcb->start_ns; // relative to socket creation
+		now_us = div_s64(now_us, 1000); // from nsecs to usecs
+
+		mpts->kind = TCPOPT_MPTCP;
+		mpts->len = MPTCP_SUB_LEN_TIMESTAMP;
+		mpts->sub = MPTCP_SUB_TIMESTAMP;
+		mpts->rsv1 = 0;
+		mpts->rsv2 = 0;
+
+		mpts->time_usecs = now_us & 0x7fffffff; // 32 bit
+
+		if (tp->loss_count > 0) {
+			tp->loss_count--;
+			mpts->time_usecs |= (1 << 31);
+		}
+
+		ptr += MPTCP_SUB_LEN_TIMESTAMP_ALIGN >> 2;
 	}
 }
 

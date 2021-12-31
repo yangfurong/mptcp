@@ -1858,6 +1858,53 @@ void mptcp_parse_options(const uint8_t *ptr, int opsize,
 		mopt->mptcp_sender_key = ((struct mp_fclose *)ptr)->key;
 
 		break;
+	case MPTCP_SUB_TIMESTAMP:
+	{
+		struct timespec now;
+		s64             recv_usecs;
+		int             loss;
+
+		struct mp_timestamp *mpts = (struct mp_timestamp *)ptr;
+
+		if (opsize != MPTCP_SUB_LEN_TIMESTAMP) {
+			mptcp_debug("%s: mp_timestamp: bad option size %d\n",
+				    __func__, opsize);
+			break;
+		}
+
+		getnstimeofday(&now);
+
+		mopt->mp_timestamp = 1;
+
+		mopt->mptcp_rcv_ns = timespec_to_ns(&now); // local time, in nsecs
+
+		if (mpts->time_usecs & (1<<31))
+			loss = 1;
+		else
+			loss = 0;
+
+		recv_usecs = mpts->time_usecs & 0x7fffffff;
+
+		mopt->mptcp_rcvd_us = recv_usecs; // remote time, in usecs
+		mopt->mptcp_loss = loss;
+		break;
+	}
+	case MPTCP_SUB_GROUP:
+	{
+		struct mp_group *mpgrp = (struct mp_group *)ptr;
+
+		if (opsize != MPTCP_SUB_LEN_GROUP) {
+			mptcp_debug("%s: mp_group: bad option size %d\n",
+				    __func__, opsize);
+			break;
+		}
+
+		mopt->mp_group = 1;
+		mopt->mptcp_group_epoch = mpgrp->epoch;
+		mopt->mptcp_group = mpgrp->group;
+		mopt->mptcp_group_flow_id = mpgrp->flow_id;
+		break;
+	}
 	default:
 		mptcp_debug("%s: Received unkown subtype: %d\n",
 			    __func__, mp_opt->sub);
@@ -2128,6 +2175,178 @@ static inline void mptcp_path_array_check(struct sock *meta_sk)
 	}
 }
 
+// implemented in mptcp_sbd.c
+void mptcp_execute_sbd(struct sock* meta_sk, int dest_index);
+
+#define SBD_MAD_VAR_SCALE 3
+
+static s64 calc_mad_mean(struct tcp_sock *tp, int dest_index)
+{
+  int i;
+  s64 mean;
+
+  for (i = 0; i < SBD_N_1; ++i) {
+    struct mptcp_owd_snapshot *snap = &tp->mptcp->owd_snapshots[i];
+    if (snap->index != dest_index - 1) // use the one from the previous snapshot
+      continue;
+
+    if (snap->count == 0)
+      return 0;
+
+    mean = div_s64(snap->sum_usecs << SBD_MAD_VAR_SCALE, snap->count);
+    return mean;
+  }
+
+  return 0;
+}
+
+
+#define LONG_TERM_MEAN_SCALE 3
+
+static s64 calc_long_term_mean(struct tcp_sock *tp, int dest_index)
+{
+  int i;
+  s64 sum = 0;
+  int count = 0;
+
+  for (i = 0; i < SBD_N_1; ++i) {
+    struct mptcp_owd_snapshot *snap = &tp->mptcp->owd_snapshots[i];
+    if (snap->index >= dest_index) // current snapshot is not included, if this changes, make sure to clear the cache!
+      continue;
+
+    if (snap->count == 0)
+      continue;
+
+    if (snap->cache_local_mean == 0) // avoid recalculation all the time
+      snap->cache_local_mean = div_s64(snap->sum_usecs << LONG_TERM_MEAN_SCALE, snap->count);
+
+    sum += snap->cache_local_mean;
+    count++;
+  }
+
+  if (count == 0)
+    return 0;
+
+  return div_s64(sum, count);
+}
+
+extern int sysctl_mptcp_sbd_sample_spacing;
+
+int mptcp_fill_snapshots_until(struct tcp_sock *tp, int cur_index)
+{
+  if (tp->mptcp->owd_snapshot_next >= cur_index)
+    return 0;
+
+  // optimization: skip ahead
+	if (tp->mptcp->owd_snapshot_next + SBD_N_1 < cur_index) {
+		tp->mptcp->owd_snapshot_next = cur_index - SBD_N_1 - 1;
+	}
+
+	while (tp->mptcp->owd_snapshot_next < cur_index) {
+		int snap_idx;
+
+		tp->mptcp->owd_snapshot_next++;
+
+		snap_idx = tp->mptcp->owd_snapshot_next % SBD_N_1;
+		if (snap_idx < 0) {
+			printk(KERN_ERR "snap_idx overflow!\n");
+			break;
+		}
+
+		memset(&tp->mptcp->owd_snapshots[snap_idx], 0, sizeof(struct mptcp_owd_snapshot));
+		tp->mptcp->owd_snapshots[snap_idx].index = tp->mptcp->owd_snapshot_next;
+	}
+
+  return 1;
+}
+
+static void mptcp_handle_owd(struct tcp_sock *tp, s64 when_nsecs, s64 owd_usecs, int loss)
+{
+  int finalized_snapshots;
+	s64 mean_delay, scaled_owd_usecs;
+	struct mptcp_owd_snapshot *snap;
+  int snap_idx;
+
+	s64 when_rel_start_nsecs = when_nsecs - tp->mpcb->start_ns;
+	int dest_index = (int)div_s64(when_rel_start_nsecs, SBD_T * 1000000);
+
+  // lock snapshots
+  spin_lock_bh(&tp->mpcb->snapshots_lock);
+
+  finalized_snapshots = mptcp_fill_snapshots_until(tp, dest_index);
+
+	if (dest_index < tp->mptcp->owd_snapshot_next) {
+		printk(KERN_ERR "asked to handle OWD for old snapshot\n");
+		goto done;
+	}
+	else if (dest_index > tp->mptcp->owd_snapshot_next) {
+		printk(KERN_ERR "asked to handle OWD for future snapshot\n");
+		goto done;
+	}
+
+	snap_idx = dest_index % SBD_N_1;
+	if (snap_idx < 0) {
+		printk(KERN_ERR "snap_idx overflow!\n");
+		goto done;
+	}
+
+	snap = &tp->mptcp->owd_snapshots[snap_idx];
+
+	if (loss)
+		snap->loss_count++;
+
+	if (sysctl_mptcp_sbd_sample_spacing > 0) {
+		int sub_index = (int)div_s64(when_rel_start_nsecs, sysctl_mptcp_sbd_sample_spacing * 1000000);
+		if (sub_index < snap->next_sample_allowed)
+			goto done; // not yet allowed to take a sample
+		snap->next_sample_allowed = sub_index + 1;
+	}
+
+  snap->sum_usecs += owd_usecs;
+	snap->count += 1;
+  if (owd_usecs > snap->max_usecs)
+    snap->max_usecs = owd_usecs;
+
+  mean_delay = calc_long_term_mean(tp, dest_index);
+  scaled_owd_usecs = owd_usecs << LONG_TERM_MEAN_SCALE;
+  if (scaled_owd_usecs < mean_delay)
+    snap->skew_lcount++;
+  else if (scaled_owd_usecs > mean_delay)
+    snap->skew_rcount++;
+
+  mean_delay = calc_mad_mean(tp, dest_index);
+  scaled_owd_usecs = owd_usecs << SBD_MAD_VAR_SCALE;
+  scaled_owd_usecs -= mean_delay; // relative to mean
+  if (scaled_owd_usecs < 0) scaled_owd_usecs = -scaled_owd_usecs; // absolute value
+  snap->mad_var_sum += scaled_owd_usecs;
+
+done:
+  if (finalized_snapshots) {
+    struct sock *meta_sk = tp->meta_sk;
+    if (sock_flag(meta_sk, SOCK_MPTCP_SBD)) {
+      mptcp_execute_sbd(meta_sk, dest_index);
+    }
+  }
+
+  // unlock snapshots
+  spin_unlock_bh(&tp->mpcb->snapshots_lock);
+}
+
+struct tcp_sock *get_mptcp_flow(struct mptcp_cb *mpcb, u16 flow_id) {
+	struct sock *sk_it;
+	struct mptcp_tcp_sock *mptcp;
+	mptcp_for_each_sub(mpcb, mptcp) {
+		sk_it = mptcp_to_sock(mptcp);
+		struct inet_sock *inet_it = inet_sk(sk_it);
+		struct tcp_sock *tp_it = tcp_sk(sk_it);
+		if (inet_it->inet_dport == flow_id) // TODO: use something better than port as that may be mucked with by NAT
+			return tp_it;
+	}
+	return 0;
+}
+
+
+
 bool mptcp_handle_options(struct sock *sk, const struct tcphdr *th,
 			  const struct sk_buff *skb)
 {
@@ -2207,6 +2426,46 @@ bool mptcp_handle_options(struct sock *sk, const struct tcphdr *th,
 	/* Socket may have been mp_killed by a REMOVE_ADDR */
 	if (tp->mp_killed)
 		return true;
+
+	if (mopt->mp_timestamp) {
+		s64 owd_us, rcv_us;
+
+		rcv_us = mopt->mptcp_rcv_ns - tp->mpcb->start_ns; // relative to socket creation
+		rcv_us = div_s64(rcv_us, 1000); // from nsecs to usecs
+		rcv_us &= 0x7fffffff; // cut back to 31 bit, like the timestamp we received
+
+		owd_us = rcv_us - mopt->mptcp_rcvd_us; // delta in usecs
+
+		mptcp_handle_owd(tp, mopt->mptcp_rcv_ns, owd_us, mopt->mptcp_loss);
+	}
+
+	if (mopt->mp_group) {
+		struct tcp_sock *pi_tp = get_mptcp_flow(tp->mpcb, mopt->mptcp_group_flow_id);
+		if (pi_tp) {
+			int i, found = -1;
+
+			spin_lock_bh(&tp->mpcb->group_history_lock);
+
+			// check if this epoch is already in the group history
+			for (i = 0; i < MPTCP_GROUP_HISTORY_SIZE; ++i) {
+			  if (pi_tp->mptcp->group_history[i].epoch == mopt->mptcp_group_epoch) {
+				found = i;
+				break;
+			  }
+			}
+
+			// .. if not insert it
+			if (found == -1) {
+			  int dest = pi_tp->mptcp->group_history_next;
+			  pi_tp->mptcp->group_history[dest].epoch = mopt->mptcp_group_epoch;
+			  pi_tp->mptcp->group_history[dest].group = mopt->mptcp_group;
+			  pi_tp->mptcp->group_history_next = (dest + 1) % MPTCP_GROUP_HISTORY_SIZE;
+			}
+
+			spin_unlock_bh(&tp->mpcb->group_history_lock);
+		}
+	}
+
 
 	return false;
 }

@@ -816,6 +816,7 @@ enum sock_flags {
 	SOCK_RCU_FREE, /* wait rcu grace period in sk_destruct() */
 	SOCK_TXTIME,
 	SOCK_MPTCP, /* MPTCP set on this socket */
+	SOCK_MPTCP_SBD, /* MPTCP-SBD: MPTCP SBD set on this socket */
 };
 
 #define SK_FLAGS_TIMESTAMP ((1UL << SOCK_TIMESTAMP) | (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE))

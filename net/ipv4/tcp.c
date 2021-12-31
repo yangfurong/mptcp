@@ -3271,6 +3271,18 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 
 		tp->record_master_info = !!(val & MPTCP_INFO_FLAG_SAVE_MASTER);
 		break;
+	case MPTCP_SBD_ENABLED:
+		if (mptcp_init_failed || !sysctl_mptcp_enabled ||
+		    sk->sk_state != TCP_CLOSE) {
+			err = -EPERM;
+			break;
+		}
+
+		if (val)
+			sock_set_flag(sk, SOCK_MPTCP_SBD);
+		else
+			sock_reset_flag(sk, SOCK_MPTCP_SBD);
+		break;
 #endif
 	case TCP_INQ:
 		if (val > 1 || val < 0)
@@ -3837,6 +3849,9 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
 			val = mptcp(tp) ? 1 : 0;
 		else
 			val = sock_flag(sk, SOCK_MPTCP) ? 1 : 0;
+		break;
+	case MPTCP_SBD_ENABLED:
+		val = sock_flag(sk, SOCK_MPTCP_SBD) ? 1 : 0;
 		break;
 	case MPTCP_INFO:
 	{

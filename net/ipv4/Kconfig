@@ -697,6 +697,13 @@ config TCP_CONG_OLIA
 	MultiPath TCP Opportunistic Linked Increase Congestion Control
 	To enable it, just put 'olia' in tcp_congestion_control
 
+config TCP_CONG_OLIASBDX
+        tristate "MPTCP Olia SBD X"
+        depends on (MPTCP=y)
+        ---help---
+		A Variant of OLIA, which only links the window growth of
+		subflows in the same group.
+
 config TCP_CONG_WVEGAS
 	tristate "MPTCP WVEGAS CONGESTION CONTROL"
 	depends on MPTCP

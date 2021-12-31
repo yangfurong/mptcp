@@ -71,6 +71,7 @@ int sysctl_mptcp_checksum __read_mostly = 1;
 int sysctl_mptcp_debug __read_mostly;
 EXPORT_SYMBOL(sysctl_mptcp_debug);
 int sysctl_mptcp_syn_retries __read_mostly = 3;
+int sysctl_mptcp_sbd_sample_spacing __read_mostly = 5; // accept a new sample every X msecs
 
 bool mptcp_init_failed __read_mostly;
 
@@ -151,6 +152,13 @@ static struct ctl_table mptcp_table[] = {
 	{
 		.procname = "mptcp_syn_retries",
 		.data = &sysctl_mptcp_syn_retries,
+		.maxlen = sizeof(int),
+		.mode = 0644,
+		.proc_handler = &proc_dointvec
+	},
+	{
+		.procname = "mptcp_sbd_sample_spacing",
+		.data = &sysctl_mptcp_sbd_sample_spacing,
 		.maxlen = sizeof(int),
 		.mode = 0644,
 		.proc_handler = &proc_dointvec
@@ -1345,6 +1353,16 @@ static int mptcp_alloc_mpcb(struct sock *meta_sk, __u64 remote_key,
 	meta_icsk->icsk_probes_out = 0;
 
 	rcu_assign_pointer(inet_sk(meta_sk)->inet_opt, NULL);
+
+
+	{
+		struct timespec now;
+		getnstimeofday(&now);
+		mpcb->start_ns = timespec_to_ns(&now);
+	}
+
+	spin_lock_init(&mpcb->snapshots_lock);
+	spin_lock_init(&mpcb->group_history_lock);
 
 	/* Set mptcp-pointers */
 	master_tp->mpcb = mpcb;

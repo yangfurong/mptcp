@@ -3021,6 +3021,12 @@ int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb, int segs)
 	return err;
 }
 
+static void mptcp_log_potential_loss(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    tp->loss_count++;
+}
+
 /* This gets called after a retransmit timeout, and the initially
  * retransmitted data is acknowledged.  It tries to continue
  * resending the rest of the retransmit queue, until either
@@ -3084,6 +3090,7 @@ void tcp_xmit_retransmit_queue(struct sock *sk)
 			return;
 
 		NET_ADD_STATS(sock_net(sk), mib_idx, tcp_skb_pcount(skb));
+		mptcp_log_potential_loss(sk);
 
 		if (tcp_in_cwnd_reduction(sk))
 			tp->prr_out += tcp_skb_pcount(skb);

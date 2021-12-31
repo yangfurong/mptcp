@@ -141,6 +141,7 @@ enum {
 #define MPTCP_SCHEDULER		43
 #define MPTCP_PATH_MANAGER	44
 #define MPTCP_INFO		45
+#define MPTCP_SBD_ENABLED   46 /* to enable SBD at the receiver */
 
 #define MPTCP_INFO_FLAG_SAVE_MASTER	0x01
 
